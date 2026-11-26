@@ -10,6 +10,7 @@ import { Pool } from "pg";
 
 import { FailFastPostgresDialect } from "../database/pg-migration-lock.js";
 import type { PostgresConfig } from "./adapters.js";
+import { withPostgresSearch } from "./postgres-search.js";
 
 const URL_PATTERN = /[A-Za-z][A-Za-z0-9+.-]*:\/\/\S+/g;
 const CREDENTIAL_PATTERN = /\b(auth|credential|key|password|secret|signature|token)\s*[=:]\s*\S+/gi;
@@ -52,5 +53,8 @@ export function createDialect(config: PostgresConfig): PostgresDialect {
 
 	// Fail-fast migration locking instead of Kysely's blocking advisory
 	// lock — see pg-migration-lock.ts (#1744).
-	return new FailFastPostgresDialect({ pool });
+	const dialect = new FailFastPostgresDialect({ pool });
+	return config.search ? withPostgresSearch(dialect) : dialect;
 }
+
+export { withPostgresSearch };

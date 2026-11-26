@@ -1,18 +1,30 @@
 /**
- * FTS5 Manager
+ * FTS Manager
  *
- * Manages FTS5 virtual tables and triggers for search indexing.
+ * Manages search index tables and the triggers that keep them in sync:
+ * FTS5 virtual tables on SQLite, tsvector tables on PostgreSQL (see
+ * postgres.ts).
  */
 
 import type { Kysely } from "kysely";
 import { sql } from "kysely";
 
-import { isSqlite, tableExists as dialectTableExists } from "../database/dialect-helpers.js";
+import { searchBackend, tableExists as dialectTableExists } from "../database/dialect-helpers.js";
+import type { SearchBackend } from "../database/dialect-helpers.js";
 import type { Database } from "../database/types.js";
 import { validateIdentifier } from "../database/validate.js";
 import { isStoragelessFieldRow } from "../schema/types.js";
 import { chunks } from "../utils/chunks.js";
 import { normalizeSearchError } from "./errors.js";
+import {
+	createPostgresIndex,
+	dropPostgresIndex,
+	PG_SYSTEM_COLUMNS,
+	populatePostgresIndex,
+	populatePostgresIndexBatch,
+	requirePostgresTextSearchConfig,
+	withPostgresIndexLock,
+} from "./postgres.js";
 import { SEARCH_TOKENIZERS } from "./types.js";
 import type { SearchConfig, SearchTokenizer } from "./types.js";
 
@@ -71,6 +83,35 @@ function parseSearchConfig(searchConfig: string, titleField: string | null): Sea
 	}
 }
 
+interface SearchMetadataRow {
+	slug: string;
+	search_config: string | null;
+	title_field: string | null;
+	searchable_fields: string;
+	has_title: unknown;
+}
+
+function buildSearchMetadata(rows: SearchMetadataRow[]): Map<string, CollectionSearchMetadata> {
+	const metadata = new Map<string, CollectionSearchMetadata>();
+	for (const row of rows) {
+		const config = row.search_config ? parseSearchConfig(row.search_config, row.title_field) : null;
+		if (!config?.enabled) continue;
+		const searchableFields: unknown = JSON.parse(row.searchable_fields);
+		if (
+			!Array.isArray(searchableFields) ||
+			!searchableFields.every((field: unknown) => typeof field === "string")
+		) {
+			throw new Error("Invalid FTS field metadata");
+		}
+		metadata.set(row.slug, {
+			config,
+			searchableFields,
+			hasTitle: Boolean(row.has_title),
+		});
+	}
+	return metadata;
+}
+
 /**
  * FTS5 Manager
  *
@@ -111,6 +152,15 @@ export class FTSManager {
 	}
 
 	/**
+	 * The table holding one row per indexed entry: FTS5's docsize shadow
+	 * table, or the index table itself on PostgreSQL.
+	 */
+	private getIndexRowsTableName(collectionSlug: string, backend: SearchBackend): string {
+		const ftsTable = this.getFtsTableName(collectionSlug);
+		return backend === "postgres" ? ftsTable : `${ftsTable}_docsize`;
+	}
+
+	/**
 	 * Check if an FTS table exists for a collection
 	 */
 	async ftsTableExists(collectionSlug: string): Promise<boolean> {
@@ -119,8 +169,9 @@ export class FTSManager {
 	}
 
 	/**
-	 * Create an FTS5 virtual table for a collection.
-	 * FTS5 is SQLite-only; on other dialects this is a no-op.
+	 * Create the search index table for a collection: an FTS5 virtual table on
+	 * SQLite, or a tsvector table on PostgreSQL with search enabled. A no-op
+	 * when the database has no search backend.
 	 *
 	 * @param collectionSlug - The collection slug
 	 * @param searchableFields - Array of field names to index
@@ -130,13 +181,34 @@ export class FTSManager {
 	async createFtsTable(
 		collectionSlug: string,
 		searchableFields: string[],
-		_weights?: Record<string, number>,
+		weights?: Record<string, number>,
 		tokenize?: SearchTokenizer,
 	): Promise<void> {
 		const tokenizer = resolveSearchTokenizer(tokenize);
-		if (!isSqlite(this.db)) return;
+		const backend = searchBackend(this.db);
+		if (!backend) return;
 		this.validateInputs(collectionSlug, searchableFields);
 		const ftsTable = this.getFtsTableName(collectionSlug);
+
+		if (backend === "postgres") {
+			if (searchableFields.length === 0) {
+				throw new Error(
+					`Cannot create a search index for collection "${collectionSlug}": no searchable fields.`,
+				);
+			}
+			const fieldTypes = await this.getFieldTypes(collectionSlug);
+			await withPostgresIndexLock(this.db, ftsTable, (trx) =>
+				createPostgresIndex(trx, {
+					ftsTable,
+					contentTable: this.getContentTableName(collectionSlug),
+					fields: searchableFields,
+					fieldTypes,
+					tokenize: tokenizer,
+					weights,
+				}),
+			);
+			return;
+		}
 
 		// Build the column list for FTS5
 		// id and locale are UNINDEXED (used for joining/filtering, not searched)
@@ -323,9 +395,15 @@ export class FTSManager {
 	 * Drop the FTS table and triggers for a collection
 	 */
 	async dropFtsTable(collectionSlug: string): Promise<void> {
-		if (!isSqlite(this.db)) return;
+		const backend = searchBackend(this.db);
+		if (!backend) return;
 		this.validateInputs(collectionSlug);
 		const ftsTable = this.getFtsTableName(collectionSlug);
+
+		if (backend === "postgres") {
+			await withPostgresIndexLock(this.db, ftsTable, (trx) => dropPostgresIndex(trx, ftsTable));
+			return;
+		}
 
 		try {
 			// Drop triggers first
@@ -349,8 +427,20 @@ export class FTSManager {
 		weights?: Record<string, number>,
 		tokenize?: SearchTokenizer,
 	): Promise<void> {
-		resolveSearchTokenizer(tokenize);
-		if (!isSqlite(this.db)) return;
+		const tokenizer = resolveSearchTokenizer(tokenize);
+		const backend = searchBackend(this.db);
+		if (!backend) return;
+		if (backend === "postgres") {
+			requirePostgresTextSearchConfig(tokenizer);
+			this.validateInputs(collectionSlug, searchableFields);
+			await withPostgresIndexLock(this.db, this.getFtsTableName(collectionSlug), async (trx) => {
+				const manager = new FTSManager(trx);
+				await manager.dropFtsTable(collectionSlug);
+				await manager.createFtsTable(collectionSlug, searchableFields, weights, tokenize);
+				await manager.populateFromContent(collectionSlug, searchableFields);
+			});
+			return;
+		}
 		// Drop existing table and triggers
 		await this.dropFtsTable(collectionSlug);
 
@@ -368,11 +458,22 @@ export class FTSManager {
 	 * per isolate) converges instead of failing on the rowid constraint.
 	 */
 	async populateFromContent(collectionSlug: string, searchableFields: string[]): Promise<void> {
-		if (!isSqlite(this.db)) return;
+		const backend = searchBackend(this.db);
+		if (!backend) return;
 		this.validateInputs(collectionSlug, searchableFields);
 		const ftsTable = this.getFtsTableName(collectionSlug);
 		const contentTable = this.getContentTableName(collectionSlug);
 		const fieldTypes = await this.getFieldTypes(collectionSlug);
+
+		if (backend === "postgres") {
+			await populatePostgresIndex(this.db, {
+				ftsTable,
+				contentTable,
+				fields: searchableFields,
+				fieldTypes,
+			});
+			return;
+		}
 		const fieldList = searchableFields.join(", ");
 		// Table-qualified references: json_tree exposes columns named
 		// key/value/type/path/..., and inside the extraction subquery a bare
@@ -392,10 +493,50 @@ export class FTSManager {
 	}
 
 	/**
+	 * Index the next batch of up to `limit` content rows, so a large collection
+	 * can be populated across several requests. `cursor` is null for the first
+	 * batch, then the value returned by the previous call; null is returned
+	 * when no rows remain. The cursor is a rowid on SQLite and a content id on
+	 * PostgreSQL, so it is only meaningful to the database that issued it.
+	 */
+	async populateBatch(
+		collectionSlug: string,
+		searchableFields: string[],
+		cursor: string | null,
+		limit: number,
+	): Promise<string | null> {
+		const backend = searchBackend(this.db);
+		if (!backend) return null;
+		if (backend === "fts5") {
+			const last = await this.populateRange(
+				collectionSlug,
+				searchableFields,
+				cursor === null ? 0 : Number(cursor),
+				limit,
+			);
+			return last === null ? null : String(last);
+		}
+		this.validateInputs(collectionSlug, searchableFields);
+		return populatePostgresIndexBatch(
+			this.db,
+			{
+				ftsTable: this.getFtsTableName(collectionSlug),
+				contentTable: this.getContentTableName(collectionSlug),
+				fields: searchableFields,
+				fieldTypes: await this.getFieldTypes(collectionSlug),
+			},
+			cursor,
+			limit,
+		);
+	}
+
+	/**
 	 * Index up to `limit` content rows with `rowid > afterRowid`, in rowid
 	 * order, so a large collection can be populated across several requests.
-	 * Returns the last rowid covered, or null when no rows remain. Returns
-	 * null on dialects without FTS5.
+	 * Returns the last rowid covered, or null when no rows remain.
+	 *
+	 * PostgreSQL tables have no rowid, so there the first call populates every
+	 * row in one statement and returns null; use `populateBatch` to page.
 	 */
 	async populateRange(
 		collectionSlug: string,
@@ -403,7 +544,12 @@ export class FTSManager {
 		afterRowid: number,
 		limit: number,
 	): Promise<number | null> {
-		if (!isSqlite(this.db)) return null;
+		const backend = searchBackend(this.db);
+		if (!backend) return null;
+		if (backend === "postgres") {
+			if (afterRowid === 0) await this.populateFromContent(collectionSlug, searchableFields);
+			return null;
+		}
 		this.validateInputs(collectionSlug, searchableFields);
 		const ftsTable = this.getFtsTableName(collectionSlug);
 		const contentTable = this.getContentTableName(collectionSlug);
@@ -455,7 +601,9 @@ export class FTSManager {
 	async getSearchMetadata(
 		collectionSlugs?: string[],
 	): Promise<Map<string, CollectionSearchMetadata>> {
-		if (!isSqlite(this.db)) return new Map();
+		const backend = searchBackend(this.db);
+		if (!backend) return new Map();
+		if (backend === "postgres") return this.getPostgresSearchMetadata(collectionSlugs);
 
 		let query = this.db
 			.selectFrom("_emdash_collections as c")
@@ -490,29 +638,41 @@ export class FTSManager {
 			);
 		}
 
-		const metadata = new Map<string, CollectionSearchMetadata>();
 		const rows = await query.execute().catch((error: unknown) => {
 			throw normalizeSearchError(error);
 		});
-		for (const row of rows) {
-			const config = row.search_config
-				? parseSearchConfig(row.search_config, row.title_field)
-				: null;
-			if (!config?.enabled) continue;
-			const searchableFields: unknown = JSON.parse(row.searchable_fields);
-			if (
-				!Array.isArray(searchableFields) ||
-				!searchableFields.every((field: unknown) => typeof field === "string")
-			) {
-				throw new Error("Invalid FTS field metadata");
-			}
-			metadata.set(row.slug, {
-				config,
-				searchableFields,
-				hasTitle: Boolean(row.has_title),
-			});
+		return buildSearchMetadata(rows);
+	}
+
+	private async getPostgresSearchMetadata(
+		collectionSlugs?: string[],
+	): Promise<Map<string, CollectionSearchMetadata>> {
+		let query = this.db
+			.selectFrom("_emdash_collections as c")
+			.select([
+				"c.slug",
+				"c.search_config",
+				"c.title_field",
+				// Weights are applied per column, in the index's physical column order.
+				sql<string>`(
+					SELECT coalesce(json_agg(column_name::text ORDER BY ordinal_position), '[]'::json)::text
+					FROM information_schema.columns
+					WHERE table_schema = current_schema()
+					AND table_name = ${"_emdash_fts_"} || c.slug
+					AND column_name NOT IN (${sql.join(PG_SYSTEM_COLUMNS)})
+				)`.as("searchable_fields"),
+				sql<boolean>`EXISTS (
+					SELECT 1 FROM _emdash_fields WHERE collection_id = c.id AND slug = 'title'
+				)`.as("has_title"),
+			])
+			.where("c.search_config", "is not", null).where(sql<boolean>`EXISTS (
+				SELECT 1 FROM information_schema.tables
+				WHERE table_schema = current_schema() AND table_name = ${"_emdash_fts_"} || c.slug
+			)`);
+		if (collectionSlugs?.length) {
+			query = query.where("c.slug", "in", collectionSlugs);
 		}
-		return metadata;
+		return buildSearchMetadata(await query.execute());
 	}
 
 	/**
@@ -603,8 +763,11 @@ export class FTSManager {
 		if (options?.tokenize !== undefined) {
 			resolveSearchTokenizer(options.tokenize);
 		}
-		if (!isSqlite(this.db)) {
-			throw new Error("Full-text search is only available with SQLite databases");
+		if (!searchBackend(this.db)) {
+			throw new Error(
+				"Full-text search is not enabled for this PostgreSQL database. " +
+					"Pass `search: true` to `postgres()`, or wrap a custom dialect with `withPostgresSearch()`.",
+			);
 		}
 		// Get searchable fields
 		const searchableFields = await this.getSearchableFields(collectionSlug);
@@ -637,7 +800,7 @@ export class FTSManager {
 	 * Drops the FTS table and triggers.
 	 */
 	async disableSearch(collectionSlug: string): Promise<void> {
-		if (!isSqlite(this.db)) return;
+		if (!searchBackend(this.db)) return;
 		await this.dropFtsTable(collectionSlug);
 		const existing = await this.getSearchConfig(collectionSlug);
 		await this.setSearchConfig(collectionSlug, {
@@ -653,10 +816,10 @@ export class FTSManager {
 	async getIndexStats(
 		collectionSlug: string,
 	): Promise<{ indexed: number; lastRebuilt?: string } | null> {
-		if (!isSqlite(this.db)) return null;
+		const backend = searchBackend(this.db);
+		if (!backend) return null;
 		this.validateInputs(collectionSlug);
-		const ftsTable = this.getFtsTableName(collectionSlug);
-		const ftsDocsizeTable = `${ftsTable}_docsize`;
+		const indexRowsTable = this.getIndexRowsTableName(collectionSlug, backend);
 
 		// Check if table exists
 		if (!(await this.ftsTableExists(collectionSlug))) {
@@ -664,12 +827,12 @@ export class FTSManager {
 		}
 
 		// Count indexed rows
-		const result = await sql<{ count: number }>`
-			SELECT COUNT(*) as count FROM "${sql.raw(ftsDocsizeTable)}"
+		const result = await sql<{ count: number | string }>`
+			SELECT COUNT(*) as count FROM ${sql.ref(indexRowsTable)}
 		`.execute(this.db);
 
 		return {
-			indexed: result.rows[0]?.count ?? 0,
+			indexed: Number(result.rows[0]?.count ?? 0),
 		};
 	}
 
@@ -686,10 +849,10 @@ export class FTSManager {
 		collectionSlug: string,
 		options: { checkRowCounts?: boolean } = {},
 	): Promise<boolean> {
-		if (!isSqlite(this.db)) return false;
+		const backend = searchBackend(this.db);
+		if (!backend) return false;
 		this.validateInputs(collectionSlug);
-		const ftsTable = this.getFtsTableName(collectionSlug);
-		const ftsDocsizeTable = `${ftsTable}_docsize`;
+		const ftsDocsizeTable = this.getIndexRowsTableName(collectionSlug, backend);
 		const contentTable = this.getContentTableName(collectionSlug);
 		const fields = await this.getSearchableFields(collectionSlug);
 		const config = await this.getSearchConfig(collectionSlug);
@@ -708,7 +871,7 @@ export class FTSManager {
 			// A rebuild can stop after creating the table but before its atomic
 			// populate statement completes. Probe the docsize table first; the
 			// live-content probe uses the content table's deleted_at index.
-			const emptyIndex = await sql<{ needsRepair: number }>`
+			const emptyIndex = await sql<{ needsRepair: number | boolean }>`
 				SELECT EXISTS (
 					SELECT 1 FROM ${sql.ref(contentTable)} WHERE deleted_at IS NULL
 				) AS ${sql.ref("needsRepair")}
@@ -723,17 +886,17 @@ export class FTSManager {
 
 		// Row count parity check against the docsize shadow table, which
 		// tracks rows actually present in the full-text index.
-		const contentCount = await sql<{ count: number }>`
+		const contentCount = await sql<{ count: number | string }>`
 			SELECT COUNT(*) as count FROM ${sql.ref(contentTable)}
 			WHERE deleted_at IS NULL
 		`.execute(this.db);
 
-		const ftsCount = await sql<{ count: number }>`
-			SELECT COUNT(*) as count FROM "${sql.raw(ftsDocsizeTable)}"
+		const ftsCount = await sql<{ count: number | string }>`
+			SELECT COUNT(*) as count FROM ${sql.ref(ftsDocsizeTable)}
 		`.execute(this.db);
 
-		const contentRows = contentCount.rows[0]?.count ?? 0;
-		const ftsRows = ftsCount.rows[0]?.count ?? 0;
+		const contentRows = Number(contentCount.rows[0]?.count ?? 0);
+		const ftsRows = Number(ftsCount.rows[0]?.count ?? 0);
 
 		if (contentRows !== ftsRows) {
 			console.warn(
@@ -755,19 +918,22 @@ export class FTSManager {
 	 * or empty indexes without counting content or FTS rows.
 	 */
 	async verifyAndRepairAll(options: { checkRowCounts?: boolean } = {}): Promise<number> {
-		if (!isSqlite(this.db)) return 0;
+		const backend = searchBackend(this.db);
+		if (!backend) return 0;
 
-		const collections = await this.db
-			.selectFrom("_emdash_collections as c")
-			.select([
-				"c.slug",
-				"c.search_config",
-				"c.title_field",
-				sql<number>`EXISTS (
+		const hasIndex =
+			backend === "postgres"
+				? sql<number | boolean>`EXISTS (
+					SELECT 1 FROM information_schema.tables
+					WHERE table_schema = current_schema() AND table_name = ${"_emdash_fts_"} || c.slug
+				)`
+				: sql<number | boolean>`EXISTS (
 					SELECT 1 FROM sqlite_master
 					WHERE type = 'table' AND name = ${"_emdash_fts_"} || c.slug
-				)`.as("has_index"),
-			])
+				)`;
+		const collections = await this.db
+			.selectFrom("_emdash_collections as c")
+			.select(["c.slug", "c.search_config", "c.title_field", hasIndex.as("has_index")])
 			.where("c.search_config", "is not", null)
 			.execute();
 		const enabled = collections.filter(
@@ -783,7 +949,7 @@ export class FTSManager {
 			try {
 				const probes = batch.map(({ slug }, index) => {
 					const content = sql.ref(this.getContentTableName(slug));
-					const docsize = sql.ref(`${this.getFtsTableName(slug)}_docsize`);
+					const docsize = sql.ref(this.getIndexRowsTableName(slug, backend));
 					const needsRepair =
 						options.checkRowCounts === false
 							? sql`NOT EXISTS (SELECT 1 FROM ${docsize}) AND EXISTS (
@@ -793,13 +959,14 @@ export class FTSManager {
 							!= (SELECT COUNT(*) FROM ${docsize})`;
 					return needsRepair.as(`probe_${index}`);
 				});
-				const result = await sql<Record<string, number>>`SELECT ${sql.join(probes)}`.execute(
-					this.db,
-				);
+				const result = await sql<
+					Record<string, number | boolean>
+				>`SELECT ${sql.join(probes)}`.execute(this.db);
 				const row = result.rows[0];
 				if (row) {
 					for (const [index, collection] of batch.entries()) {
-						if (row[`probe_${index}`] === 0) healthy.add(collection.slug);
+						const needsRepair = row[`probe_${index}`];
+						if (needsRepair === 0 || needsRepair === false) healthy.add(collection.slug);
 					}
 				}
 			} catch {

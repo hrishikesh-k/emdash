@@ -67,6 +67,8 @@ export interface PlanInputs {
 	packageDigest: `sha256:${string}`;
 	manifest: SitePackageManifest;
 	target: PlanTarget;
+	/** Whether the target database has a full-text search backend. Defaults to SQLite targets only. */
+	targetSearch?: boolean;
 	summary: ValidationSummary;
 	validationBlockers: readonly PlanBlocker[];
 	validationWarnings: readonly PlanWarning[];
@@ -175,17 +177,16 @@ export function buildPlan(inputs: PlanInputs, bylines: PrincipalBylines): SiteIm
 	if (inputs.localeRecasing.length > 0) {
 		transformations.push({ code: "locale_recased", locales: [...inputs.localeRecasing] });
 	}
-	if (inputs.target.dialect === "postgres") {
-		if (summary.searchEnabledCollections.length > 0) {
-			transformations.push({
-				code: "search_unsupported",
-				kind: "collection",
-				ids: summary.searchEnabledCollections.slice(0, MAX_LISTED_IDS),
-			});
-		}
-		if (summary.float4Rounded > 0) {
-			transformations.push({ code: "float4_rounded", count: summary.float4Rounded });
-		}
+	const targetSearch = inputs.targetSearch ?? inputs.target.dialect === "sqlite";
+	if (!targetSearch && summary.searchEnabledCollections.length > 0) {
+		transformations.push({
+			code: "search_unsupported",
+			kind: "collection",
+			ids: summary.searchEnabledCollections.slice(0, MAX_LISTED_IDS),
+		});
+	}
+	if (inputs.target.dialect === "postgres" && summary.float4Rounded > 0) {
+		transformations.push({ code: "float4_rounded", count: summary.float4Rounded });
 	}
 
 	const plan: SiteImportPlan = {

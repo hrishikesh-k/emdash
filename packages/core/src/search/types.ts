@@ -87,7 +87,9 @@ export interface SearchResult {
 	 * Relevance tie-breaker (higher = more relevant).
 	 * `search()` normalizes to 0–1 per collection; title tiers and shorter
 	 * title-term matches take precedence.
-	 * `searchCollection()` returns the raw BM25 magnitude.
+	 * `searchCollection()` returns the raw relevance: the BM25 magnitude on
+	 * SQLite, or the `ts_rank` value on PostgreSQL. The two scales differ, so
+	 * raw scores are only comparable within one database.
 	 */
 	score: number;
 }

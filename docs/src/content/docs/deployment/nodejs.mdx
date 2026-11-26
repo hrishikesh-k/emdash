@@ -7,7 +7,7 @@ import { Aside } from "@astrojs/starlight/components";
 
 This guide uses SQLite and local storage for one server. Use PostgreSQL or libSQL when several instances need one database, and S3-compatible storage when media must survive independently of the server disk.
 
-Built-in full-text search requires SQLite or libSQL with FTS5 support on Node.js. It is unavailable on PostgreSQL. See [Choose a database](/deployment/database/#overview) for search availability across database adapters.
+Built-in full-text search requires SQLite or libSQL with FTS5 support on Node.js, or PostgreSQL with [PostgreSQL search turned on](/deployment/database/#full-text-search). See [Choose a database](/deployment/database/#overview) for search availability across database adapters.
 
 ## Prerequisites
 

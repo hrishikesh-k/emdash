@@ -60,7 +60,7 @@ import { getTrustedProxyHeaders } from "./auth/trusted-proxy.js";
 import { lookupContentAuthor, sendCommentNotification } from "./comments/notifications.js";
 import type { ContentFieldFilters } from "./content-list-query.js";
 import { keepKnownFields, staleStoredKeys } from "./content/known-fields.js";
-import { isSqlite } from "./database/dialect-helpers.js";
+import { searchBackend } from "./database/dialect-helpers.js";
 import { kyselyLogOption } from "./database/instrumentation.js";
 import {
 	enforceRuntimeMigrationPolicy,
@@ -4250,9 +4250,9 @@ export class EmDashRuntime {
 	 * defend against FTS not existing yet (pre-setup).
 	 */
 	async ensureSearchHealthy(): Promise<void> {
-		// Non-SQLite has no FTS to verify; the check is a cheap synchronous
-		// branch, no need to cache it.
-		if (!isSqlite(this._db)) return;
+		// Without a search backend there is no index to verify; the check is a
+		// cheap synchronous branch, no need to cache it.
+		if (!searchBackend(this._db)) return;
 		try {
 			await singleFlightCached(
 				this._searchHealthCache,

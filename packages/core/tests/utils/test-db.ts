@@ -24,6 +24,7 @@ import type {
 import { FailFastPostgresDialect } from "../../src/database/pg-migration-lock.js";
 import type { Database as DatabaseSchema } from "../../src/database/types.js";
 import { openNodeSqliteDatabase } from "../../src/db/node-sqlite-compat.js";
+import { withPostgresSearch } from "../../src/db/postgres-search.js";
 import { waitForDeferredTasks } from "../../src/deferred-tasks.js";
 import { resetRegisteredCollectionsCacheForTests } from "../../src/schema/collection-slugs-cache.js";
 import { SchemaRegistry } from "../../src/schema/registry.js";
@@ -380,7 +381,9 @@ export interface PgTestContext {
  *
  * Call `teardownTestPostgresDatabase()` in afterEach to drop the schema.
  */
-export async function createTestPostgresDatabase(): Promise<PgTestContext> {
+export async function createTestPostgresDatabase(
+	options: { search?: boolean } = {},
+): Promise<PgTestContext> {
 	resetSchemaCachesForTests();
 	const connectionString = await getWorkerConnectionString();
 	const pool = await getSharedPool();
@@ -403,10 +406,11 @@ export async function createTestPostgresDatabase(): Promise<PgTestContext> {
 		options: `-c search_path=${schemaName},public`,
 	});
 
+	// Same dialect as the production Postgres adapters so every PG test
+	// exercises the fail-fast migration lock.
+	const dialect = new FailFastPostgresDialect({ pool: testPool });
 	const db = new Kysely<DatabaseSchema>({
-		// Same dialect as the production Postgres adapters so every PG test
-		// exercises the fail-fast migration lock.
-		dialect: new FailFastPostgresDialect({ pool: testPool }),
+		dialect: options.search ? withPostgresSearch(dialect) : dialect,
 	});
 
 	return { db, schemaName };
@@ -415,8 +419,10 @@ export async function createTestPostgresDatabase(): Promise<PgTestContext> {
 /**
  * Setup a Postgres test database with migrations run.
  */
-export async function setupTestPostgresDatabase(): Promise<PgTestContext> {
-	const ctx = await createTestPostgresDatabase();
+export async function setupTestPostgresDatabase(
+	options: { search?: boolean } = {},
+): Promise<PgTestContext> {
+	const ctx = await createTestPostgresDatabase(options);
 	await runMigrations(ctx.db, { migrationTableSchema: ctx.schemaName });
 	return ctx;
 }

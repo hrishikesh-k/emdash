@@ -209,6 +209,12 @@ export interface PostgresConfig {
 		/** Time before an idle client is closed, in milliseconds. Uses the pg default when omitted. */
 		idleTimeoutMillis?: number;
 	};
+	/**
+	 * Serve EmDash's built-in full-text search from PostgreSQL text search.
+	 * Defaults to false, in which case the search API reports
+	 * `SEARCH_UNAVAILABLE`.
+	 */
+	search?: boolean;
 	migrationConnectionStringEnv?: string;
 }
 

@@ -12,7 +12,7 @@
 import type { Kysely } from "kysely";
 import { z } from "zod";
 
-import { detectDialect } from "../../database/dialect-helpers.js";
+import { detectDialect, searchBackend } from "../../database/dialect-helpers.js";
 import { OptionsRepository } from "../../database/repositories/options.js";
 import type { Database } from "../../database/types.js";
 import type { Storage } from "../../storage/types.js";
@@ -311,6 +311,7 @@ async function buildAnalysisPlan(
 			packageDigest: await reader.digest(),
 			manifest,
 			target,
+			targetSearch: searchBackend(db) !== null,
 			summary,
 			validationBlockers: validation.blockers,
 			validationWarnings: validation.warnings,

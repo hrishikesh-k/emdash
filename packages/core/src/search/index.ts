@@ -1,7 +1,8 @@
 /**
  * Search Module
  *
- * Full-text search for EmDash using SQLite FTS5.
+ * Full-text search for EmDash using SQLite FTS5, or PostgreSQL text search
+ * when the database opts in with `withPostgresSearch()`.
  */
 
 // Types

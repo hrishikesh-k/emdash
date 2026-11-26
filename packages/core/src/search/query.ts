@@ -7,6 +7,7 @@
 import type { Kysely, RawBuilder } from "kysely";
 import { sql } from "kysely";
 
+import { searchBackend } from "../database/dialect-helpers.js";
 import { encodeCursor, decodeCursor, InvalidCursorError } from "../database/repositories/types.js";
 import type { Database } from "../database/types.js";
 import { validateIdentifier } from "../database/validate.js";
@@ -15,6 +16,13 @@ import { localeMatches } from "../i18n/query.js";
 import { getDb } from "../loader.js";
 import { FTSManager } from "./fts-manager.js";
 import type { CollectionSearchMetadata } from "./fts-manager.js";
+import {
+	buildPostgresTsQuery,
+	columnVector,
+	PG_DOCUMENT_COLUMN,
+	postgresTextSearchConfig,
+	postgresWeighting,
+} from "./postgres.js";
 import type {
 	SearchOptions,
 	CollectionSearchOptions,
@@ -71,20 +79,27 @@ const FTS_OPERATORS_PATTERN = /\b(AND|OR|NOT|NEAR)\b/;
 const DOUBLE_QUOTE_PATTERN = /"/g;
 
 /**
- * Detect FTS5 query syntax errors. Match specifically on the SQLite FTS5
- * error fingerprints rather than a broad "fts5" / "syntax error" filter
- * (which would also swallow internal table-corruption errors). The two
- * fingerprints we care about are:
+ * Detect search query syntax errors. Match specifically on the error
+ * fingerprints for malformed user input rather than a broad "fts5" /
+ * "syntax error" filter (which would also swallow internal table-corruption
+ * errors). The fingerprints we care about are:
  *
  *  - "fts5: syntax error near …" — unbalanced quotes, stray operators,
  *    other malformed user input
  *  - "unknown special query: …" — bare special tokens like `^*` that
  *    parse but don't resolve to a real FTS5 directive
+ *  - "syntax error in tsquery" / "no operand in tsquery" — the PostgreSQL
+ *    equivalents for malformed operator queries
  */
-function isFts5SyntaxError(error: unknown): boolean {
+function isSearchSyntaxError(error: unknown): boolean {
 	if (!(error instanceof Error)) return false;
 	const message = error.message.toLowerCase();
-	return message.includes("fts5: syntax error") || message.includes("unknown special query");
+	return (
+		message.includes("fts5: syntax error") ||
+		message.includes("unknown special query") ||
+		message.includes("syntax error in tsquery") ||
+		message.includes("no operand in tsquery")
+	);
 }
 
 // All queries must start before awaiting, but collection order determines tie
@@ -279,6 +294,17 @@ async function searchSingleCollection(
 	// Validate before any raw SQL interpolation
 	validateIdentifier(collection, "collection slug");
 
+	if (searchBackend(db) === "postgres") {
+		return searchSingleCollectionPostgres(
+			db,
+			collection,
+			query,
+			options,
+			metadata,
+			rankAcrossCollections,
+		);
+	}
+
 	const ftsManager = new FTSManager(db);
 	const ftsTable = ftsManager.getFtsTableName(collection);
 	const contentTable = ftsManager.getContentTableName(collection);
@@ -357,17 +383,6 @@ async function searchSingleCollection(
 	const titleLengthExpr = searchableFields.includes(titleColumn)
 		? sql`coalesce(length(c.${sql.ref(titleColumn)}), 0)`
 		: sql`0`;
-	type SearchRow = {
-		id: string;
-		slug: string | null;
-		locale: string;
-		title: string | null;
-		snippet: string | null;
-		score: number;
-		title_match_tier: number;
-		raw_score: number;
-		title_length: number;
-	};
 	const fromMatches = sql`FROM "${sql.raw(ftsTable)}" f
 		JOIN "${sql.raw(contentTable)}" c ON f.id = c.id
 		WHERE "${sql.raw(ftsTable)}" MATCH ${matchQuery}
@@ -416,7 +431,7 @@ async function searchSingleCollection(
 		// trigger this path, and the underlying error message embeds the
 		// raw query, so logging would be both noisy and a log-injection
 		// vector.
-		if (isFts5SyntaxError(error)) {
+		if (isSearchSyntaxError(error)) {
 			return [];
 		}
 		throw error;
@@ -439,6 +454,186 @@ async function searchSingleCollection(
 		rawScore: row.raw_score,
 		titleLength: row.title_length,
 	}));
+}
+
+type SearchRow = {
+	id: string;
+	slug: string | null;
+	locale: string;
+	title: string | null;
+	snippet: string | null;
+	score: number;
+	title_match_tier: number;
+	raw_score: number;
+	title_length: number;
+};
+
+function toRankedResult(collection: string, row: SearchRow): RankedSearchResult {
+	return {
+		collection,
+		id: row.id,
+		slug: row.slug,
+		locale: row.locale,
+		title: row.title ?? undefined,
+		snippet: row.snippet === null ? undefined : sanitizeSnippet(row.snippet),
+		score: Math.abs(Number(row.score)),
+		titleMatchTier: Number(row.title_match_tier),
+		rawScore: Number(row.raw_score),
+		titleLength: Number(row.title_length),
+	};
+}
+
+/**
+ * Resolve the title column search matches and ranks against: the configured
+ * titleField, else a `title` field, provided it is indexed.
+ */
+function indexedTitleColumn(metadata: CollectionSearchMetadata): string | undefined {
+	const { titleField } = metadata.config;
+	if (titleField && metadata.searchableFields.includes(titleField)) return titleField;
+	if (metadata.searchableFields.includes("title")) return "title";
+	return undefined;
+}
+
+/**
+ * PostgreSQL counterpart of the FTS5 query in searchSingleCollection, with
+ * the same result shape and ordering. Relevance is `ts_rank`, summed per
+ * column with the configured weights when there are any.
+ */
+async function searchSingleCollectionPostgres(
+	db: Kysely<Database>,
+	collection: string,
+	query: string,
+	options: CollectionSearchOptions,
+	metadata: CollectionSearchMetadata,
+	rankAcrossCollections: boolean,
+): Promise<RankedSearchResult[]> {
+	const { searchableFields, hasTitle, config } = metadata;
+	const textSearchConfig = postgresTextSearchConfig(config.tokenize ?? "porter unicode61");
+	if (!textSearchConfig || searchableFields.length === 0) return [];
+
+	const ftsManager = new FTSManager(db);
+	const ftsTable = sql.ref(ftsManager.getFtsTableName(collection));
+	const contentTable = sql.ref(ftsManager.getContentTableName(collection));
+	const limit = options.limit ?? 20;
+	const status = options.status ?? "published";
+	const locale = options.locale ? resolveConfiguredLocale(options.locale) : undefined;
+	const titleScope = options.scope === "title";
+
+	const tsQuery = buildPostgresTsQuery(query, textSearchConfig, !titleScope);
+	if (!tsQuery) return [];
+
+	const titleColumn = indexedTitleColumn(metadata);
+	if (titleScope && !titleColumn) return [];
+	if (titleColumn) validateIdentifier(titleColumn, "title field");
+	for (const field of searchableFields) validateIdentifier(field, "searchable field name");
+
+	let titleExpr;
+	if (config.titleField) {
+		validateIdentifier(config.titleField, "title field");
+		titleExpr = sql`c.${sql.ref(config.titleField)}`;
+	} else {
+		titleExpr = hasTitle ? sql`c.title` : sql`NULL`;
+	}
+
+	const document = sql`f.${sql.ref(PG_DOCUMENT_COLUMN)}`;
+	// Field weights are stored as tsvector labels when the index is built, so
+	// ranking reads only the stored vector.
+	const weighting = postgresWeighting(searchableFields, config.weights);
+	const rankExpr = weighting
+		? sql`ts_rank(ARRAY[${sql.join(weighting.rankWeights)}]::float4[], ${document}, q.q)`
+		: sql`ts_rank(${document}, q.q)`;
+
+	let titleMatchTier = sql`0`;
+	if (rankAcrossCollections && titleColumn) {
+		const tier = buildPostgresTitleMatchTier(titleColumn, query, textSearchConfig);
+		if (tier) titleMatchTier = tier;
+	}
+	const titleLengthExpr = titleColumn
+		? sql`coalesce(length(c.${sql.ref(titleColumn)}), 0)`
+		: sql`0`;
+
+	const snippetField = sql.ref(searchableFields[0]);
+	const snippetOptions =
+		"StartSel=<mark>, StopSel=</mark>, MaxWords=32, MinWords=8, MaxFragments=1, FragmentDelimiter=...";
+
+	// Scores are normalized against the best match among every matching row,
+	// not just the LIMITed window, so they stay stable across pages.
+	const normalizedScore = rankAcrossCollections
+		? sql`coalesce(m.score / nullif(max(m.score) OVER (), 0), 0)`
+		: sql`m.score`;
+
+	const statement = sql<SearchRow>`
+		WITH q AS (SELECT ${tsQuery} AS q),
+		matches AS (
+			SELECT c.id, (${rankExpr})::float8 AS score,
+				${titleMatchTier} AS title_match_tier, ${titleLengthExpr} AS title_length
+			FROM ${ftsTable} f
+			JOIN ${contentTable} c ON f.id = c.id
+			CROSS JOIN q
+			WHERE ${document} @@ q.q
+			${titleScope && titleColumn ? sql`AND ${columnVector(sql`f.${sql.ref(titleColumn)}`, textSearchConfig)} @@ q.q` : sql``}
+			AND c.status = ${status}
+			AND c.deleted_at IS NULL
+			${locale ? sql`AND ${localeMatches("c.locale", locale)}` : sql``}
+		),
+		ranked AS (
+			SELECT m.id, m.title_match_tier, m.title_length, m.score AS raw_score,
+				${normalizedScore} AS score
+			FROM matches m
+			ORDER BY m.title_match_tier DESC,
+				CASE WHEN m.title_match_tier = 1 THEN m.title_length ELSE 0 END ASC,
+				score DESC, raw_score DESC, m.title_length ASC, m.id COLLATE "C"
+			LIMIT ${limit}
+		)
+		SELECT c.id, c.slug, c.locale, ${titleExpr} AS title,
+			ts_headline(${textSearchConfig}::regconfig, f.${snippetField}, q.q, ${snippetOptions}) AS snippet,
+			r.score, r.title_match_tier, r.raw_score, r.title_length
+		FROM ranked r
+		JOIN ${contentTable} c ON c.id = r.id
+		JOIN ${ftsTable} f ON f.id = c.id
+		CROSS JOIN q
+		ORDER BY r.title_match_tier DESC,
+			CASE WHEN r.title_match_tier = 1 THEN r.title_length ELSE 0 END ASC,
+			r.score DESC, r.raw_score DESC, r.title_length ASC, c.id COLLATE "C"
+	`;
+	let rows;
+	try {
+		rows = await statement.execute(db);
+	} catch (error) {
+		// Malformed operator queries are user input, not failures; see searchSingleCollection.
+		if (isSearchSyntaxError(error)) return [];
+		throw error;
+	}
+
+	return rows.rows.map((row) => toRankedResult(collection, row));
+}
+
+/**
+ * Title tiers for cross-collection ranking on PostgreSQL: 2 when the title
+ * equals the query (case-insensitively), 1 when the title alone matches it.
+ */
+function buildPostgresTitleMatchTier(
+	titleColumn: string,
+	query: string,
+	textSearchConfig: string,
+): RawBuilder<number> | null {
+	const trimmed = query.trim();
+	const phrase = trimmed.startsWith('"') && trimmed.endsWith('"');
+	const exact = phrase ? trimmed.slice(1, -1).trim() : trimmed;
+	const terms = phrase
+		? trimmed
+		: trimmed
+				.split(WHITESPACE_SPLIT_PATTERN)
+				.filter((term) => !TITLE_OPERATOR_PATTERN.test(term))
+				.join(" ");
+	const titleQuery = buildPostgresTsQuery(terms, textSearchConfig, false);
+	if (!titleQuery) return null;
+	const title = sql`c.${sql.ref(titleColumn)}`;
+	return sql<number>`CASE
+		WHEN lower(trim(${title})) = lower(${exact}) THEN 2
+		WHEN ${columnVector(title, textSearchConfig)} @@ ${titleQuery} THEN 1
+		ELSE 0
+	END`;
 }
 
 // Module-scope regexes so the engine doesn't recompile per call —
@@ -567,6 +762,40 @@ export async function getSuggestions(
 			const ftsTable = ftsManager.getFtsTableName(collection);
 			const contentTable = ftsManager.getContentTableName(collection);
 
+			if (searchBackend(db) === "postgres") {
+				const textSearchConfig = postgresTextSearchConfig(config.tokenize ?? "porter unicode61");
+				const tsQuery = textSearchConfig ? buildPostgresTsQuery(query, textSearchConfig) : null;
+				if (!tsQuery) return [];
+				const document = sql`f.${sql.ref(PG_DOCUMENT_COLUMN)}`;
+				const statement = sql<{ id: string; slug: string | null; title: string }>`
+					WITH q AS (SELECT ${tsQuery} AS q)
+					SELECT c.id, c.slug, ${titleExpr} AS title
+					FROM ${sql.ref(ftsTable)} f
+					JOIN ${sql.ref(contentTable)} c ON f.id = c.id
+					CROSS JOIN q
+					WHERE ${document} @@ q.q
+					AND c.status = 'published'
+					AND c.deleted_at IS NULL
+					AND ${titleExpr} IS NOT NULL
+					${locale ? sql`AND ${localeMatches("c.locale", locale)}` : sql``}
+					ORDER BY ts_rank(${document}, q.q) DESC, c.id COLLATE "C"
+					LIMIT ${limit}
+				`;
+				let rows;
+				try {
+					rows = await statement.execute(db);
+				} catch (error) {
+					if (isSearchSyntaxError(error)) return [];
+					throw error;
+				}
+				return rows.rows.map((row) => ({
+					collection,
+					id: row.id,
+					slug: row.slug,
+					title: row.title,
+				}));
+			}
+
 			let results;
 			try {
 				results = await sql<{
@@ -593,7 +822,7 @@ export async function getSuggestions(
 				// queries should yield no suggestions, not surface DB errors.
 				// Intentionally not logged (anonymous-triggerable, echoes
 				// user input -- see searchSingleCollection for rationale).
-				if (isFts5SyntaxError(error)) {
+				if (isSearchSyntaxError(error)) {
 					return [];
 				}
 				throw error;

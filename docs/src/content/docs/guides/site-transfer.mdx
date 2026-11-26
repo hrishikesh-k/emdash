@@ -414,7 +414,7 @@ The import declares its own changes:
 | `principal_unmapped` | References to unmapped principals are removed. |
 | `seeded_scaffold_removed` | Setup scaffold on the target is deleted before the import writes. The plan lists each item. |
 | `redirect_loop_disabled` | Redirects that form a loop are imported disabled. |
-| `search_unsupported` | Search is turned off for the listed collections because the target uses PostgreSQL. |
+| `search_unsupported` | Search is turned off for the listed collections because the target uses PostgreSQL without [PostgreSQL search](/deployment/database/#full-text-search). |
 | `float4_rounded` | Decimal values are rounded to the precision of the target's PostgreSQL `real` columns. |
 | `locale_recased` | Locales are written with the target's configured casing, such as `pt-br` as `pt-BR`. |
 

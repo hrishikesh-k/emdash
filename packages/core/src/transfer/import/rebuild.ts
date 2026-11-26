@@ -2,9 +2,9 @@
  * The `rebuild` stage: derived state the importer does not write row by row.
  *
  * - `search`: full-text indexes for collections whose package search config
- *   is enabled, populated in rowid ranges, then the collection's final
- *   `search_config` (SQLite only; the plan declares `search_unsupported`
- *   elsewhere).
+ *   is enabled, populated in rowid ranges (in one statement on PostgreSQL),
+ *   then the collection's final `search_config`. Targets without a search
+ *   backend get `search_unsupported` in the plan instead.
  * - `media_usage`: every imported collection is marked stale so the
  *   media-usage maintenance engine re-indexes it.
  * - `options`: `POST_IMPORT_OPTION_RESETS`.
@@ -15,7 +15,7 @@
 
 import { sql } from "kysely";
 
-import { isSqlite } from "../../database/dialect-helpers.js";
+import { searchBackend } from "../../database/dialect-helpers.js";
 import { parseTaxonomyCollections } from "../../database/repositories/taxonomy-def.js";
 import { markContentMediaUsageCollectionStale } from "../../media/usage/content-refresh.js";
 import {
@@ -146,7 +146,7 @@ async function searchTargets(context: ImportContext): Promise<SearchTarget[]> {
 		const config = final.searchConfig;
 		if (typeof config !== "object" || config === null || Array.isArray(config)) continue;
 		if (config.enabled !== true) continue;
-		if (!isSqlite(context.db)) {
+		if (!searchBackend(context.db)) {
 			throw new TransferError(
 				"TRANSFER_IMPORT_ERROR",
 				"Full-text search is not available on this target",
@@ -158,13 +158,19 @@ async function searchTargets(context: ImportContext): Promise<SearchTarget[]> {
 	return targets;
 }
 
-/** `after`: null, `slug` (done), or `slug:rowid` (index created, rows ≤ rowid indexed). */
+/**
+ * `after`: null, `slug` (done), or `slug:cursor` (index created, rows up to
+ * the populate cursor indexed). An empty cursor means no rows indexed yet;
+ * `slug:0` from older positions means the same on SQLite.
+ */
 async function searchUnit(
 	context: ImportContext,
 	after: string | null,
 ): Promise<RebuildPosition | null | "budget"> {
-	const [doneSlug, rowidText] = after?.split(":") ?? [];
-	const inProgress = rowidText === undefined ? null : Number(rowidText);
+	const separator = after?.indexOf(":") ?? -1;
+	const doneSlug =
+		after === null ? undefined : separator === -1 ? after : after.slice(0, separator);
+	const inProgress = after === null || separator === -1 ? null : after.slice(separator + 1);
 	const target = (await searchTargets(context)).find((candidate) =>
 		inProgress === null
 			? doneSlug === undefined || compareIds(candidate.record.slug, doneSlug) > 0
@@ -194,14 +200,21 @@ async function searchUnit(
 				isTokenizer(target.config.tokenize) ? target.config.tokenize : undefined,
 			);
 		}
-		return { step: "search", after: `${slug}:0` };
+		return { step: "search", after: `${slug}:` };
 	}
 
 	if (!context.budget.canStart({ queries: FTS_POPULATE_STATEMENTS })) return "budget";
 	context.budget.start();
 	const fields = await fts.getSearchableFields(slug);
 	const last =
-		fields.length > 0 ? await fts.populateRange(slug, fields, inProgress, FTS_ROWS_PER_UNIT) : null;
+		fields.length > 0
+			? await fts.populateBatch(
+					slug,
+					fields,
+					inProgress === "" ? null : inProgress,
+					FTS_ROWS_PER_UNIT,
+				)
+			: null;
 	if (last !== null) return { step: "search", after: `${slug}:${last}` };
 	await context.db
 		.updateTable("_emdash_collections")

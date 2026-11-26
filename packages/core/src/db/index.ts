@@ -20,6 +20,7 @@
  */
 
 export { sqlite, libsql, postgres } from "./adapters.js";
+export { withPostgresSearch } from "./postgres-search.js";
 export type {
 	DatabaseDescriptor,
 	DatabaseDialectType,

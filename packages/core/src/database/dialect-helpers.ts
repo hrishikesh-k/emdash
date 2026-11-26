@@ -51,6 +51,29 @@ export function isPostgres(db: Kysely<any>): boolean {
 	return detectDialect(db) === "postgres";
 }
 
+/**
+ * Declared by a PostgreSQL adapter whose database serves EmDash's built-in
+ * full-text search. Postgres search is opt-in because enabling it adds index
+ * tables and sync triggers to every search-enabled collection; see
+ * `withPostgresSearch()`.
+ */
+export interface PostgresSearchAdapter {
+	readonly postgresSearch: true;
+}
+
+export type SearchBackend = "fts5" | "postgres";
+
+/**
+ * The full-text search implementation available on this database, or null
+ * when built-in search is unavailable (PostgreSQL without the opt-in).
+ */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any -- accepts any Kysely instance
+export function searchBackend(db: Kysely<any>): SearchBackend | null {
+	if (isSqlite(db)) return "fts5";
+	const adapter: object = db.getExecutor().adapter;
+	return "postgresSearch" in adapter && adapter.postgresSearch === true ? "postgres" : null;
+}
+
 /** Literal substring position, avoiding D1's 50-byte LIKE pattern limit. */
 export function textPosition<DB>(
 	db: Kysely<DB>,
