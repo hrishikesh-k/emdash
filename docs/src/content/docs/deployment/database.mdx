@@ -310,7 +310,7 @@ export function createDialect(config) {
 }
 ```
 
-When you enable search for a collection, EmDash creates an `_emdash_fts_<collection>` table with a GIN index, a `plpgsql` function, and triggers on the collection's content table. This requires PostgreSQL 12 or later, and the database role needs permission to create functions and triggers.
+When you enable search for a collection, EmDash creates an `_emdash_fts_<collection>` table with a GIN index, a `plpgsql` function, and triggers on the collection's content table. This requires PostgreSQL 12 or later, and the database role needs permission to create functions and triggers. While EmDash fills the index, which happens when you enable or rebuild search and during site imports, saves to that collection wait until the fill finishes. On a large collection, enable or rebuild search when few editors are working.
 
 PostgreSQL search differs from FTS5 search in these ways:
 

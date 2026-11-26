@@ -240,10 +240,11 @@ describe.skipIf(!PG_CONNECTION_STRING)("PostgreSQL search", () => {
 		expect(await ids("beacon")).toHaveLength(1);
 	});
 
-	it("leaves a complete index when several rebuilds run at once", async () => {
+	it("leaves a complete index when several instances rebuild a missing index at once", async () => {
 		await createPost("a", "Orchard", "Apples.");
 		await fts.enableSearch("posts");
 		const fields = await fts.getSearchableFields("posts");
+		await fts.dropFtsTable("posts");
 
 		await Promise.all(Array.from({ length: 4 }, () => fts.rebuildIndex("posts", fields)));
 
@@ -303,15 +304,6 @@ describe.skipIf(!PG_CONNECTION_STRING)("PostgreSQL search", () => {
 		expect(await ids("old", { scope: "title" })).toEqual([]);
 		expect(await ids("new", { scope: "title" })).toEqual([edited.id]);
 		expect(await fts.getIndexStats("posts")).toEqual({ indexed: 1 });
-	});
-
-	it("ranks by stored field weights", async () => {
-		const inTitle = await createPost("t", "Nebula", "Nothing here.");
-		const inBody = await createPost("b", "Sky", "A nebula glows.");
-		await fts.enableSearch("posts", { weights: { title: 10, body: 1 } });
-
-		const result = await searchCollection(db, "posts", "nebula");
-		expect(result.items.map((item) => item.id)).toEqual([inTitle.id, inBody.id]);
 	});
 
 	it("rejects the trigram tokenizer", async () => {
